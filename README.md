@@ -37,4 +37,4 @@ It is fully automatic, there is nothing to type or tune while it runs.
    the scene (diagonal of the bounding box), so it works for other files too.
 
 ## PCD files and Results folder
-`results/` To access the PCD files and result files, contact me
+To access the PCD files and result files, contact me
