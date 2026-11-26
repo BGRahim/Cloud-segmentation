@@ -1,0 +1,404 @@
+"""
+3D point cloud segmentation: finds ONE sphere and several planes.
+
+Usage:
+    python main.py <input_file.pcd> <output_file.ply>
+
+Idea (RANSAC):
+    1. pick a few random points
+    2. make a shape (sphere or plane) from them
+    3. count how many points are close to that shape (inliers)
+    4. repeat many times and keep the shape with the most inliers
+We do this once for the sphere, then again and again for the planes,
+removing the points we already explained each time.
+
+Only numpy is really needed. I wrote the file reading/writing myself.
+"""
+
+import sys
+import numpy as np
+import plotly.graph_objects as go
+
+# ---------------------------------------------------------------
+# 1. Reading the PCD file
+# ---------------------------------------------------------------
+def read_pcd(path):
+    """Reads a .pcd file and returns an array of shape (N, 3) with x, y, z."""
+    f = open(path, "rb")
+
+    # --- read the header (text lines until the line that starts with DATA) ---
+    fields = []
+    sizes = []
+    types = []
+    counts = []
+    data_type = ""
+    while True:
+        line = f.readline().decode("ascii", errors="ignore").strip()
+        if line == "":
+            if f.tell() == 0:
+                break
+            continue
+        parts = line.split()
+        key = parts[0].upper()
+        if key == "FIELDS":
+            fields = parts[1:]
+        elif key == "SIZE":
+            sizes = [int(s) for s in parts[1:]]
+        elif key == "TYPE":
+            types = parts[1:]
+        elif key == "COUNT":
+            counts = [int(c) for c in parts[1:]]
+        elif key == "DATA":
+            data_type = parts[1].lower()
+            break
+
+    if len(fields) == 0 or data_type == "":
+        raise ValueError("This does not look like a valid PCD file (header problem).")
+    if counts == []:
+        counts = [1] * len(fields)
+    for name in ["x", "y", "z"]:
+        if name not in fields:
+            raise ValueError("The PCD file has no '" + name + "' field.")
+
+    # --- read the data part ---
+    if data_type == "ascii":
+        rows = []
+        for line in f:
+            line = line.decode("ascii", errors="ignore").strip()
+            if line == "":
+                continue
+            rows.append(line.split())
+        f.close()
+        table = np.array(rows, dtype=np.float64)
+        # with COUNT > 1 a field takes several columns, so find the real column
+        column = 0
+        positions = {}
+        for i in range(len(fields)):
+            positions[fields[i]] = column
+            column += counts[i]
+        xyz = table[:, [positions["x"], positions["y"], positions["z"]]]
+
+    elif data_type == "binary":
+        # build a numpy "dtype" that describes one point
+        code_map = {("F", 4): "f4", ("F", 8): "f8",
+                    ("U", 1): "u1", ("U", 2): "u2", ("U", 4): "u4", ("U", 8): "u8",
+                    ("I", 1): "i1", ("I", 2): "i2", ("I", 4): "i4", ("I", 8): "i8"}
+        dtype_list = []
+        for i in range(len(fields)):
+            code = code_map[(types[i], sizes[i])]
+            if counts[i] == 1:
+                dtype_list.append((fields[i], code))
+            else:
+                dtype_list.append((fields[i], code, (counts[i],)))
+        raw = f.read()
+        f.close()
+        point_dtype = np.dtype(dtype_list)
+        n = len(raw) // point_dtype.itemsize
+        table = np.frombuffer(raw, dtype=point_dtype, count=n)
+        xyz = np.stack([table["x"], table["y"], table["z"]], axis=1).astype(np.float64)
+
+    else:
+        f.close()
+        raise ValueError("DATA type '" + data_type + "' is not supported (only ascii and binary).")
+
+    # depth cameras often give NaN points (no measurement), throw those away
+    good = np.isfinite(xyz).all(axis=1)
+    xyz = xyz[good]
+    # the camera also gives (0, 0, 0) for pixels with no depth, remove those too
+    not_zero = np.abs(xyz).sum(axis=1) > 0
+    xyz = xyz[not_zero]
+    return xyz
+
+
+# ---------------------------------------------------------------
+# 2. Writing the PLY file
+# ---------------------------------------------------------------
+def write_ply(path, points, colors):
+    """Writes an ASCII .ply file with x y z r g b for every point."""
+    f = open(path, "w")
+    f.write("ply\n")
+    f.write("format ascii 1.0\n")
+    f.write("element vertex " + str(len(points)) + "\n")
+    f.write("property float x\n")
+    f.write("property float y\n")
+    f.write("property float z\n")
+    f.write("property uchar red\n")
+    f.write("property uchar green\n")
+    f.write("property uchar blue\n")
+    f.write("end_header\n")
+    for i in range(len(points)):
+        x, y, z = points[i]
+        r, g, b = colors[i]
+        f.write("%f %f %f %d %d %d\n" % (x, y, z, r, g, b))
+    f.close()
+
+
+def save_plotly_html(path, points, colors):
+    color_strings = [f'rgb({r},{g},{b})' for r, g, b in colors]
+    fig = go.Figure(data=[go.Scatter3d(
+        x=points[:, 0], y=points[:, 1], z=points[:, 2],
+        mode='markers',
+        marker=dict(size=2, color=color_strings)
+    )])
+    fig.write_html(path, auto_open=False)
+    print(f"Successfully saved interactive 3D model to {path}")
+
+# ---------------------------------------------------------------
+# 3. Fitting shapes
+# ---------------------------------------------------------------
+def plane_from_3_points(p1, p2, p3):
+    """Plane  a*x + b*y + c*z + d = 0.  Returns (normal, d) or None."""
+    normal = np.cross(p2 - p1, p3 - p1)
+    length = np.linalg.norm(normal)
+    if length < 1e-12:
+        return None  # the 3 points are on one line, no plane
+    normal = normal / length
+    d = -np.dot(normal, p1)
+    return normal, d
+
+
+def plane_from_many_points(points):
+    """Best plane through many points using SVD (least squares)."""
+    center = points.mean(axis=0)
+    u, s, vt = np.linalg.svd(points - center, full_matrices=False)
+    normal = vt[2]  # direction with the smallest spread = the normal
+    d = -np.dot(normal, center)
+    return normal, d
+
+
+def distance_to_plane(points, normal, d):
+    return np.abs(points @ normal + d)
+
+
+def sphere_from_points(points):
+    """
+    Sphere through 4 or more points.
+    A point p on the sphere with center c and radius r satisfies
+        |p|^2 = 2*c.p + (r^2 - |c|^2)
+    This is a linear equation in c and k = r^2 - |c|^2, so we just
+    solve it with least squares. Returns (center, radius) or None.
+    """
+    A = np.hstack([2 * points, np.ones((len(points), 1))])
+    b = (points ** 2).sum(axis=1)
+    solution, residuals, rank, sv = np.linalg.lstsq(A, b, rcond=None)
+    center = solution[:3]
+    r_squared = solution[3] + np.dot(center, center)
+    if r_squared <= 0 or rank < 4:
+        return None
+    return center, np.sqrt(r_squared)
+
+
+def distance_to_sphere(points, center, radius):
+    return np.abs(np.linalg.norm(points - center, axis=1) - radius)
+
+
+# ---------------------------------------------------------------
+# 4. RANSAC
+# ---------------------------------------------------------------
+def find_sphere(points, threshold, max_radius, iterations=2000):
+    """Returns (center, radius, inlier_mask) of the best sphere, or None."""
+    n = len(points)
+    best_count = 0
+    best_model = None
+
+    for i in range(iterations):
+        idx = np.random.choice(n, 4, replace=False)
+        model = sphere_from_points(points[idx])
+        if model is None:
+            continue
+        center, radius = model
+        # a huge "sphere" is just a flat wall in disguise, so skip it
+        if radius > max_radius:
+            continue
+        dist = distance_to_sphere(points, center, radius)
+        count = np.sum(dist < threshold)
+        if count > best_count:
+            best_count = count
+            best_model = model
+
+    if best_model is None:
+        return None
+
+    # refine: refit the sphere using all of its inliers, then count again
+    center, radius = best_model
+    for i in range(3):
+        mask = distance_to_sphere(points, center, radius) < threshold
+        if mask.sum() < 4:
+            break
+        new_model = sphere_from_points(points[mask])
+        if new_model is None or new_model[1] > max_radius:
+            break
+        center, radius = new_model
+    mask = distance_to_sphere(points, center, radius) < threshold
+    return center, radius, mask
+
+
+def find_plane(points, threshold, iterations=1000):
+    """Returns (normal, d, inlier_mask) of the best plane, or None."""
+    n = len(points)
+    if n < 3:
+        return None
+    best_count = 0
+    best_model = None
+
+    for i in range(iterations):
+        idx = np.random.choice(n, 3, replace=False)
+        model = plane_from_3_points(points[idx[0]], points[idx[1]], points[idx[2]])
+        if model is None:
+            continue
+        normal, d = model
+        dist = distance_to_plane(points, normal, d)
+        count = np.sum(dist < threshold)
+        if count > best_count:
+            best_count = count
+            best_model = model
+
+    if best_model is None:
+        return None
+
+    # refine with SVD on the inliers
+    normal, d = best_model
+    for i in range(3):
+        mask = distance_to_plane(points, normal, d) < threshold
+        if mask.sum() < 3:
+            break
+        normal, d = plane_from_many_points(points[mask])
+    mask = distance_to_plane(points, normal, d) < threshold
+    return normal, d, mask
+
+
+# ---------------------------------------------------------------
+# 5. Putting everything together
+# ---------------------------------------------------------------
+PLANE_COLORS = [[230, 25, 75], [60, 180, 75], [0, 130, 200], [245, 130, 48],
+                [145, 30, 180], [70, 240, 240], [240, 50, 230], [210, 245, 60],
+                [0, 128, 128], [170, 110, 40], [128, 0, 0], [0, 0, 128]]
+
+
+def random_sample(points, how_many):
+    """RANSAC on 200k points is slow, so we search on a random sample."""
+    if len(points) <= how_many:
+        return points
+    idx = np.random.choice(len(points), how_many, replace=False)
+    return points[idx]
+
+
+def find_all_planes(points, free, colors, threshold, min_points, plane_count):
+    """
+    Finds planes one after another among the points that are still free.
+    Each plane gets its own color. Stops when the best plane is too small.
+    Returns the new number of planes.
+    """
+    while plane_count < 20:
+        free_idx = np.where(free)[0]
+        if len(free_idx) < min_points:
+            break
+        free_points = points[free_idx]
+
+        result = find_plane(random_sample(free_points, 30000), threshold)
+        if result is None:
+            break
+        normal, d, _ = result
+
+        # test the plane on ALL free points, and refine it once with SVD
+        mask = distance_to_plane(free_points, normal, d) < threshold
+        if mask.sum() >= 3:
+            normal, d = plane_from_many_points(free_points[mask])
+            mask = distance_to_plane(free_points, normal, d) < threshold
+
+        if mask.sum() < min_points:
+            break  # best plane is too small, so the rest is noise
+
+        if plane_count < len(PLANE_COLORS):
+            color = PLANE_COLORS[plane_count]
+        else:
+            color = list(np.random.randint(40, 230, 3))
+        chosen = free_idx[mask]
+        colors[chosen] = color
+        free[chosen] = False
+        plane_count += 1
+        print("Plane", plane_count, ": points", int(mask.sum()))
+    return plane_count
+
+
+def segment(points):
+    """Returns an (N, 3) array of colors (0-255) for the points."""
+    n = len(points)
+    np.random.seed(0)  # same result every run
+
+    GREY = [128, 128, 128]
+    YELLOW = [255, 255, 0]
+    colors = np.array([GREY] * n, dtype=np.int32)
+    free = np.ones(n, dtype=bool)  # True = not used by any shape yet
+
+    # The thresholds depend on the size of the scene (diagonal of the
+    # bounding box) so nothing is fixed for one specific dataset.
+    diagonal = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
+    threshold = 0.006 * diagonal
+    max_radius = 0.15 * diagonal
+
+    # ---- step 1: only the BIG planes (walls, floor...) ----
+    # Why first? A sphere with a huge radius looks almost flat, so if we look
+    # for the sphere first RANSAC sometimes picks a wall by mistake.
+    plane_count = find_all_planes(points, free, colors, threshold, int(0.04 * n), 0)
+
+    # ---- step 2: the sphere, among the points that are left ----
+    free_idx = np.where(free)[0]
+    free_points = points[free_idx]
+    result = find_sphere(random_sample(free_points, 30000), threshold, max_radius)
+    if result is not None:
+        center, radius, _ = result
+        # every point on the sphere surface counts, even if a plane took it before
+        mask = distance_to_sphere(points, center, radius) < threshold
+        colors[mask] = YELLOW
+        free[mask] = False
+        print("Sphere: center", np.round(center, 1), "radius", round(float(radius), 1),
+              "points", int(mask.sum()))
+    else:
+        print("No sphere found.")
+
+    # ---- step 3: smaller planes in what is left ----
+    plane_count = find_all_planes(points, free, colors, threshold, int(0.02 * n), plane_count)
+
+    print("Planes found:", plane_count)
+    print("Unclassified points:", int(free.sum()))
+    return colors
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("Usage: python main.py <input_file.pcd> <output_file.ply>")
+        sys.exit(1)
+    input_path = sys.argv[1]
+    output_path = sys.argv[2]
+
+    try:
+        # This is the line that was missing! It reads the file to create 'points'.
+        points = read_pcd(input_path)
+    except Exception as e:
+        print("Could not read the input file:", e)
+        sys.exit(1)
+
+    if len(points) < 10:
+        print("Not enough points in the file.")
+        sys.exit(1)
+    print("Read", len(points), "points")
+
+    # Now that 'points' exists, it can be passed to segment
+    colors = segment(points)
+
+    try:
+        write_ply(output_path, points, colors)
+        
+        html_path = output_path.replace('.ply', '.html')
+        save_plotly_html(html_path, points, colors)
+        
+    except Exception as e:
+        print("Could not write the output file:", e)
+        sys.exit(1)
+    print("Saved", output_path)
+
+if __name__ == "__main__":
+    main()
+
+#--------------------------------------------
