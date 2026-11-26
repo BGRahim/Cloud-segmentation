@@ -36,5 +36,5 @@ It is fully automatic, there is nothing to type or tune while it runs.
 5. The thresholds are not fixed numbers, they are a fraction of the size of
    the scene (diagonal of the bounding box), so it works for other files too.
 
-## Results folder
-`results/` has 4 example outputs (Frame4994, Frame9387, Frame15439, Frame5551).
+## PCD files and Results folder
+`results/` To access the PCD files and result files, contact me
